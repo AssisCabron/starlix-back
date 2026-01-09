@@ -6,7 +6,7 @@ import axios from 'axios';
 
 dotenv.config();
 
-const ASAAS_API_URL = process.env.ASAAS_API_URL || 'https://sandbox.asaas.com/api/v3';
+const ASAAS_API_URL = process.env.ASAAS_API_URL || 'https://api.asaas.com/api/v3';
 const ASAAS_API_KEY = process.env.ASAAS_API_KEY || '';
 
 const app = express();
@@ -249,10 +249,18 @@ async function checkPendingPayments() {
     try {
         // 1. Get all PENDING payments from DB
         console.log(`[${new Date().toLocaleTimeString()}] Poller: Fetching pending payments from DB...`);
-        const { data: pendingPayments, error } = await supabaseAdmin
+        
+        // Add a timeout to the database call
+        const fetchPromise = supabaseAdmin
             .from('payments')
             .select('*')
             .eq('status', 'PENDING');
+
+        const { data: pendingPayments, error } = await Promise.race([
+            fetchPromise,
+            new Promise<any>((_, reject) => setTimeout(() => reject(new Error('DB Query Timeout')), 10000))
+        ]) as any;
+
         console.log(`[${new Date().toLocaleTimeString()}] Poller: DB Fetch complete. Error: ${error ? JSON.stringify(error) : 'NONE'}`);
 
         if (error) {
@@ -333,7 +341,11 @@ async function checkPendingPayments() {
 }
 
 // Run polling every 10 seconds (faster updates)
-setInterval(checkPendingPayments, 10000);
+setInterval(() => {
+    checkPendingPayments().catch(err => {
+        console.error(`[${new Date().toLocaleTimeString()}] CRITICAL: Poller Interval Crash:`, err);
+    });
+}, 10000);
 
 
 // --- ASAAS INTEGRATION ---
