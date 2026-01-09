@@ -19,6 +19,8 @@ app.use(cors({
 app.use(express.json());
 
 // Supabase Admin Client (For bypassing email verification)
+console.log("Supabase URL:", process.env.SUPABASE_URL ? "LOADED" : "NOT LOADED");
+console.log("Supabase Admin Key:", process.env.SUPABASE_SERVICE_ROLE_KEY ? "LOADED" : "NOT LOADED");
 const supabaseAdmin = createClient(
     process.env.SUPABASE_URL || '',
     process.env.SUPABASE_SERVICE_ROLE_KEY || ''
@@ -246,24 +248,37 @@ async function checkPendingPayments() {
     console.log("Checking pending payments...");
     try {
         // 1. Get all PENDING payments from DB
+        console.log(`[${new Date().toLocaleTimeString()}] Poller: Fetching pending payments from DB...`);
         const { data: pendingPayments, error } = await supabaseAdmin
             .from('payments')
             .select('*')
             .eq('status', 'PENDING');
+        console.log(`[${new Date().toLocaleTimeString()}] Poller: DB Fetch complete. Error: ${error ? JSON.stringify(error) : 'NONE'}`);
 
-        if (error || !pendingPayments || pendingPayments.length === 0) return;
+        if (error) {
+            console.error(`[${new Date().toLocaleTimeString()}] Poller Error:`, error);
+            return;
+        }
+
+        if (!pendingPayments || pendingPayments.length === 0) {
+            console.log(`[${new Date().toLocaleTimeString()}] Poller: 0 pending payments.`);
+            return;
+        }
+
+        console.log(`[${new Date().toLocaleTimeString()}] Poller: Found ${pendingPayments.length} payments.`);
 
         for (const payment of pendingPayments) {
             try {
                 // 2. Check status in Asaas
+                console.log(`Checking Asaas status for ${payment.asaas_id} (Internal ID: ${payment.id})`);
                 const response = await axios.get(`${ASAAS_API_URL}/payments/${payment.asaas_id}`, {
                     headers: { access_token: ASAAS_API_KEY }
                 });
 
                 const asaasStatus = response.data.status;
-                // Asaas statuses: 'RECEIVED', 'CONFIRMED', 'OVERDUE', 'PENDING'
+                console.log(`Asaas status for ${payment.asaas_id}: ${asaasStatus}`);
 
-                if (asaasStatus === 'RECEIVED' || asaasStatus === 'CONFIRMED') {
+                if (asaasStatus === 'RECEIVED' || asaasStatus === 'CONFIRMED' || asaasStatus === 'RECEIVED_IN_CASH') {
                     console.log(`Payment confirmed for user ${payment.user_id}`);
 
                     // 3. Update Payment Status in DB
@@ -440,11 +455,10 @@ app.post('/api/payments/checkout', async (req: Request, res: Response): Promise<
         });
 
         // SAVE PAYMENT TO DB
-        // If it's Credit Card it might be 'CONFIRMED' already, or 'PENDING'
-        // We save whatever status returned.
         const returnedStatus = response.data.status; 
+        console.log(`DB: Attempting to save payment ${response.data.id} for user ${user.id} with status ${returnedStatus}`);
         
-        await supabaseAdmin.from('payments').insert({
+        const { error: insertError } = await supabaseAdmin.from('payments').insert({
             user_id: user.id,
             asaas_id: response.data.id,
             amount: price,
@@ -452,32 +466,67 @@ app.post('/api/payments/checkout', async (req: Request, res: Response): Promise<
             invoice_url: response.data.invoiceUrl
         });
 
-        // 4. IMMEDIATE ACTIVATION CHECK (For Credit Card)
-        if (returnedStatus === 'CONFIRMED' || returnedStatus === 'RECEIVED') {
-             const { key, planName } = generateLicenseKey(price);
-
-             // Calculate expiry based on plan
-             let expiryDate = new Date();
-             if (planName === 'Daily') expiryDate.setDate(expiryDate.getDate() + 1);
-             else if (planName === 'Monthly') expiryDate.setDate(expiryDate.getDate() + 30);
-             else if (planName === 'Yearly') expiryDate.setDate(expiryDate.getDate() + 365);
-             else if (planName === 'Lifetime') expiryDate.setFullYear(expiryDate.getFullYear() + 99);
-
-             await supabaseAdmin
-                .from('profiles')
-                .update({
-                    plan: planName,
-                    status: 'Active',
-                    license_key: key,
-                    expires_at: expiryDate.toISOString()
-                })
-                .eq('id', user.id);
+        if (insertError) {
+            console.error("DB: Payment Insert Error:", insertError);
+        } else {
+            console.log(`DB: Payment ${response.data.id} saved successfully.`);
         }
 
+        // 4. IMMEDIATE ACTIVATION CHECK (For Credit Card)
+        if (returnedStatus === 'CONFIRMED' || returnedStatus === 'RECEIVED') {
+             try {
+                 console.log(`Immediate confirmation for payment ${response.data.id}. Status: ${returnedStatus}`);
+                 const { key, planName } = generateLicenseKey(price);
+
+                 // Calculate expiry based on plan
+                 let expiryDate = new Date();
+                 if (planName === 'Daily') expiryDate.setDate(expiryDate.getDate() + 1);
+                 else if (planName === 'Monthly') expiryDate.setDate(expiryDate.getDate() + 30);
+                 else if (planName === 'Yearly') expiryDate.setDate(expiryDate.getDate() + 365);
+                 else if (planName === 'Lifetime') expiryDate.setFullYear(expiryDate.getFullYear() + 99);
+
+                 const { error: profileUpdateError } = await supabaseAdmin
+                    .from('profiles')
+                    .update({
+                        plan: planName,
+                        status: 'Active',
+                        license_key: key,
+                        expires_at: expiryDate.toISOString()
+                    })
+                    .eq('id', user.id);
+
+                 if (profileUpdateError) {
+                     console.error("Immediate Profile Update Error:", profileUpdateError);
+                 } else {
+                     console.log(`Profile updated successfully for user ${user.id} with plan ${planName}`);
+                 }
+             } catch (actErr) {
+                 console.error("Immediate Activation Catch Error:", actErr);
+             }
+        }
+
+        let pixData = null;
+        if (returnedStatus === 'PENDING' && type === 'PIX') {
+            try {
+                const pixResponse = await axios.get(`${ASAAS_API_URL}/payments/${response.data.id}/pixQrCode`, {
+                    headers: { access_token: ASAAS_API_KEY }
+                });
+                pixData = {
+                    encodedImage: pixResponse.data.encodedImage,
+                    payload: pixResponse.data.payload,
+                    expirationDate: pixResponse.data.expirationDate
+                };
+            } catch (pixErr) {
+                console.warn("Failed to fetch PIX QR Code:", pixErr);
+            }
+        }
+
+        console.log(`Checkout response sent for payment ${response.data.id}. Internal PIX data: ${pixData ? 'YES' : 'NO'}`);
         return res.json({ 
             paymentId: response.data.id, 
             invoiceUrl: response.data.invoiceUrl,
-            pixQrCode: response.data.bankSlipUrl,
+            pixQrCode: response.data.bankSlipUrl, // Legacy/Backup
+            pix: pixData, // Internal PIX Data
             status: returnedStatus
         });
 
@@ -509,6 +558,27 @@ app.get('/api/user/billing', async (req: Request, res: Response): Promise<any> =
         .order('created_at', { ascending: false });
 
     return res.json({ history: paymentHistory || [] });
+});
+
+// 4. Payment Status Polling
+app.get('/api/payments/status/:asaas_id', async (req: Request, res: Response): Promise<any> => {
+    const { asaas_id } = req.params;
+
+    try {
+        const { data: payment, error } = await supabaseAdmin
+            .from('payments')
+            .select('status')
+            .eq('asaas_id', asaas_id)
+            .single();
+
+        if (error || !payment) {
+            return res.status(404).json({ error: 'Payment not found' });
+        }
+
+        return res.json({ status: payment.status });
+    } catch (err) {
+        return res.status(500).json({ error: 'Internal Server Error' });
+    }
 });
 
 
