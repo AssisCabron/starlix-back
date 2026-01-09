@@ -6,7 +6,7 @@ import axios from 'axios';
 
 dotenv.config();
 
-const ASAAS_API_URL = process.env.ASAAS_API_URL || 'https://api-sandbox.asaas.com/v3';
+const ASAAS_API_URL = process.env.ASAAS_API_URL || 'https://api.asaas.com/v3';
 const ASAAS_API_KEY = process.env.ASAAS_API_KEY || '';
 
 console.log('Asaas API URL:', ASAAS_API_URL);
