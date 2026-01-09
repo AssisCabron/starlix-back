@@ -6,8 +6,11 @@ import axios from 'axios';
 
 dotenv.config();
 
-const ASAAS_API_URL = process.env.ASAAS_API_URL || 'https://api.asaas.com/api/v3';
+const ASAAS_API_URL = process.env.ASAAS_API_URL || 'https://api-sandbox.asaas.com/v3';
 const ASAAS_API_KEY = process.env.ASAAS_API_KEY || '';
+
+console.log('Asaas API URL:', ASAAS_API_URL);
+console.log('Asaas API Key Loaded:', ASAAS_API_KEY ? 'YES (Starts with ' + ASAAS_API_KEY.substring(0, 10) + '...)' : 'NO');
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -131,8 +134,12 @@ app.get('/api/user/profile', async (req: Request, res: Response): Promise<any> =
 
     // --- SECURE DATA FETCH ---
     
-    // Fetch profile from 'profiles' table
-    let { data: profile, error: profileError } = await supabase
+    console.log('========================================');
+    console.log('[PROFILE ENDPOINT] Fetching profile for user:', user.id);
+    console.log('========================================');
+    
+    // Fetch profile from 'profiles' table using ADMIN client to bypass RLS
+    let { data: profile, error: profileError } = await supabaseAdmin
         .from('profiles')
         .select('*')
         .eq('id', user.id)
@@ -143,8 +150,17 @@ app.get('/api/user/profile', async (req: Request, res: Response): Promise<any> =
          return res.status(500).json({ error: 'Failed to fetch profile' });
     }
 
+    console.log('[PROFILE ENDPOINT] Profile exists:', !!profile);
+    console.log('[PROFILE ENDPOINT] Profile data:', profile ? {
+        id: profile.id,
+        email: profile.email,
+        is_reseller: profile.is_reseller,
+        has_field: 'is_reseller' in profile
+    } : 'NULL');
+
     // If no profile exists (should exist due to trigger, but fallback just in case)
     if (!profile) {
+        console.log('[PROFILE ENDPOINT] Creating fallback profile (no DB record found)');
         profile = {
             id: user.id,
             email: user.email,
@@ -157,11 +173,19 @@ app.get('/api/user/profile', async (req: Request, res: Response): Promise<any> =
     } else {
         // Map DB fields to Frontend expected fields if necessary
         // Assuming DB columns: plan, status, license_key, expires_at
+        console.log('[Backend] Raw profile from DB:', {
+            id: profile.id,
+            email: profile.email,
+            is_reseller: profile.is_reseller,
+            has_is_reseller_field: 'is_reseller' in profile
+        });
+        
         profile = {
             ...profile,
             hwid: profile.hwid ? 'Linked' : 'Not Linked',
             licenseKey: profile.license_key || 'No License',
-            expiresAt: profile.expires_at ? new Date(profile.expires_at).toLocaleDateString() : 'Never'
+            expiresAt: profile.expires_at ? new Date(profile.expires_at).toLocaleDateString() : 'Never',
+            is_reseller: profile.is_reseller || false
         };
     }
 
@@ -268,70 +292,121 @@ async function checkPendingPayments() {
             return;
         }
 
-        if (!pendingPayments || pendingPayments.length === 0) {
-            console.log(`[${new Date().toLocaleTimeString()}] Poller: 0 pending payments.`);
-            return;
+        if (pendingPayments && pendingPayments.length > 0) {
+            console.log(`[${new Date().toLocaleTimeString()}] Poller: Found ${pendingPayments.length} regular payments.`);
+
+            for (const payment of pendingPayments) {
+                try {
+                    // 2. Check status in Asaas
+                    console.log(`Checking Asaas status for ${payment.asaas_id} (Internal ID: ${payment.id})`);
+                    const response = await axios.get(`${ASAAS_API_URL}/payments/${payment.asaas_id}`, {
+                        headers: { access_token: ASAAS_API_KEY }
+                    });
+
+                    const asaasStatus = response.data.status;
+                    console.log(`Asaas status for ${payment.asaas_id}: ${asaasStatus}`);
+
+                    if (asaasStatus === 'RECEIVED' || asaasStatus === 'CONFIRMED' || asaasStatus === 'RECEIVED_IN_CASH') {
+                        console.log(`Payment confirmed for user ${payment.user_id}`);
+
+                        // 3. Update Payment Status in DB
+                        await supabaseAdmin
+                            .from('payments')
+                            .update({ status: 'PAID' })
+                            .eq('id', payment.id);
+
+                        // 4. Generate License Key
+                        const { key, planName } = generateLicenseKey(payment.amount);
+
+                        // 5. Update User Profile (Activate Plan & Set Key)
+                        // Calculate expiry
+                        let expiryDate = new Date();
+                        if (planName === 'Daily') expiryDate.setDate(expiryDate.getDate() + 1);
+                        else if (planName === 'Monthly') expiryDate.setDate(expiryDate.getDate() + 30);
+                        else if (planName === 'Yearly') expiryDate.setDate(expiryDate.getDate() + 365);
+                        else if (planName === 'Lifetime') expiryDate.setFullYear(expiryDate.getFullYear() + 99);
+
+                        await supabaseAdmin
+                            .from('profiles')
+                            .update({
+                                plan: planName,
+                                status: 'Active',
+                                license_key: key,
+                                expires_at: expiryDate.toISOString()
+                            })
+                            .eq('id', payment.user_id);
+                    } else if (asaasStatus === 'OVERDUE' || asaasStatus === 'REFUNDED') {
+                        // Mark as failed/overdue locally
+                        await supabaseAdmin
+                            .from('payments')
+                            .update({ status: asaasStatus })
+                            .eq('id', payment.id);
+                    }
+                } catch (innerErr: any) {
+                    // If payment not found (404), mark as rejected/failed to stop polling
+                    if (innerErr.response && innerErr.response.status === 404) {
+                        console.log(`Payment ${payment.asaas_id} not found in Asaas. Marking as FAILED.`);
+                        await supabaseAdmin
+                            .from('payments')
+                            .update({ status: 'FAILED' })
+                            .eq('id', payment.id);
+                    } else {
+                        console.error(`Error checking payment ${payment.asaas_id}:`, innerErr.message);
+                    }
+                }
+            }
+        } else {
+            console.log(`[${new Date().toLocaleTimeString()}] Poller: 0 regular pending payments.`);
         }
 
-        console.log(`[${new Date().toLocaleTimeString()}] Poller: Found ${pendingPayments.length} payments.`);
+        // --- RESELLER CHECK SECTION ---
+        console.log(`[${new Date().toLocaleTimeString()}] Poller: Checking reseller purchases...`);
 
-        for (const payment of pendingPayments) {
-            try {
-                // 2. Check status in Asaas
-                console.log(`Checking Asaas status for ${payment.asaas_id} (Internal ID: ${payment.id})`);
-                const response = await axios.get(`${ASAAS_API_URL}/payments/${payment.asaas_id}`, {
-                    headers: { access_token: ASAAS_API_KEY }
-                });
+        const { data: resellerPurchases } = await supabaseAdmin
+            .from('reseller_purchases')
+            .select('*')
+            .eq('payment_status', 'pending')
+            .eq('keys_generated', false)
+            .not('payment_id', 'is', null);
 
-                const asaasStatus = response.data.status;
-                console.log(`Asaas status for ${payment.asaas_id}: ${asaasStatus}`);
+        if (resellerPurchases && resellerPurchases.length > 0) {
+            console.log(`[RESELLER POLLER] Found ${resellerPurchases.length} pending purchases to check.`);
 
-                if (asaasStatus === 'RECEIVED' || asaasStatus === 'CONFIRMED' || asaasStatus === 'RECEIVED_IN_CASH') {
-                    console.log(`Payment confirmed for user ${payment.user_id}`);
+            for (const purchase of resellerPurchases) {
+                try {
+                    const response = await axios.get(`${ASAAS_API_URL}/payments/${purchase.payment_id}`, {
+                        headers: { access_token: ASAAS_API_KEY }
+                    });
 
-                    // 3. Update Payment Status in DB
-                    await supabaseAdmin
-                        .from('payments')
-                        .update({ status: 'PAID' })
-                        .eq('id', payment.id);
+                    const asaasStatus = response.data.status;
+                    console.log(`Reseller purchase ${purchase.id} - Asaas status: ${asaasStatus}`);
 
-                    // 4. Generate License Key
-                    const { key, planName } = generateLicenseKey(payment.amount);
+                    if (asaasStatus === 'RECEIVED' || asaasStatus === 'CONFIRMED' || asaasStatus === 'RECEIVED_IN_CASH') {
+                        console.log(`Generating keys for reseller purchase ${purchase.id}`);
 
-                    // 5. Update User Profile (Activate Plan & Set Key)
-                    // Calculate expiry
-                    let expiryDate = new Date();
-                    if (planName === 'Daily') expiryDate.setDate(expiryDate.getDate() + 1);
-                    else if (planName === 'Monthly') expiryDate.setDate(expiryDate.getDate() + 30);
-                    else if (planName === 'Yearly') expiryDate.setDate(expiryDate.getDate() + 365);
-                    else if (planName === 'Lifetime') expiryDate.setFullYear(expiryDate.getFullYear() + 99);
+                        const keys = [];
+                        for (let i = 0; i < purchase.quantity; i++) {
+                            const randomPart = Math.random().toString(36).substring(2, 10).toUpperCase() + 
+                                             Math.random().toString(36).substring(2, 10).toUpperCase();
+                            const licenseKey = `${purchase.plan_type.toUpperCase()}_RESELLER_${randomPart}`;
+                            
+                            keys.push({
+                                reseller_id: purchase.reseller_id,
+                                license_key: licenseKey,
+                                plan_type: purchase.plan_type,
+                                status: 'available'
+                            });
+                        }
 
-                    await supabaseAdmin
-                        .from('profiles')
-                        .update({
-                            plan: planName,
-                            status: 'Active',
-                            license_key: key,
-                            expires_at: expiryDate.toISOString()
-                        })
-                        .eq('id', payment.user_id);
-                } else if (asaasStatus === 'OVERDUE' || asaasStatus === 'REFUNDED') {
-                     // Mark as failed/overdue locally
-                     await supabaseAdmin
-                        .from('payments')
-                        .update({ status: asaasStatus })
-                        .eq('id', payment.id);
-                }
-            } catch (innerErr: any) {
-                // If payment not found (404), mark as rejected/failed to stop polling
-                if (innerErr.response && innerErr.response.status === 404) {
-                    console.log(`Payment ${payment.asaas_id} not found in Asaas. Marking as FAILED.`);
-                    await supabaseAdmin
-                        .from('payments')
-                        .update({ status: 'FAILED' })
-                        .eq('id', payment.id);
-                } else {
-                    console.error(`Error checking payment ${payment.asaas_id}:`, innerErr.message);
+                        await supabaseAdmin.from('reseller_keys').insert(keys);
+                        await supabaseAdmin.from('reseller_purchases')
+                            .update({ keys_generated: true, payment_status: 'confirmed' })
+                            .eq('id', purchase.id);
+
+                        console.log(`Successfully generated ${keys.length} keys for reseller purchase ${purchase.id}`);
+                    }
+                } catch (err) {
+                    console.error(`Error processing reseller purchase ${purchase.id}:`, err);
                 }
             }
         }
@@ -577,22 +652,382 @@ app.get('/api/payments/status/:asaas_id', async (req: Request, res: Response): P
     const { asaas_id } = req.params;
 
     try {
-        const { data: payment, error } = await supabaseAdmin
+        // 1. Check in regular payments
+        const { data: payment } = await supabaseAdmin
             .from('payments')
             .select('status')
             .eq('asaas_id', asaas_id)
             .single();
 
-        if (error || !payment) {
-            return res.status(404).json({ error: 'Payment not found' });
+        if (payment) {
+            return res.json({ status: payment.status });
         }
 
-        return res.json({ status: payment.status });
+        // 2. Check in reseller purchases
+        const { data: purchase } = await supabaseAdmin
+            .from('reseller_purchases')
+            .select('payment_status')
+            .eq('payment_id', asaas_id)
+            .single();
+
+        if (purchase) {
+            // Map 'confirmed' to 'CONFIRMED' for frontend consistency if needed
+            const status = purchase.payment_status?.toUpperCase() || 'PENDING';
+            return res.json({ status });
+        }
+
+        return res.status(404).json({ error: 'Payment not found' });
     } catch (err) {
+        console.error('Status check error:', err);
         return res.status(500).json({ error: 'Internal Server Error' });
     }
 });
 
+
+// --- RESELLER SYSTEM ---
+
+// Wholesale pricing for resellers
+const WHOLESALE_PRICES: Record<string, number> = {
+    daily: 7.00,
+    monthly: 20.00,
+    yearly: 100.00,
+    lifetime: 200.00
+};
+
+// 1. Get Reseller Dashboard Stats
+app.get('/api/reseller/dashboard', async (req: Request, res: Response): Promise<any> => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Missing Token' });
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Invalid Token' });
+
+    // Check if user is a reseller
+    const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('is_reseller, reseller_balance, reseller_total_sales')
+        .eq('id', user.id)
+        .single();
+
+    if (!profile?.is_reseller) {
+        return res.status(403).json({ error: 'Not authorized as reseller' });
+    }
+
+    // Get available keys count by plan type
+    const { data: availableKeys } = await supabaseAdmin
+        .from('reseller_keys')
+        .select('plan_type')
+        .eq('reseller_id', user.id)
+        .eq('status', 'available');
+
+    const keysByPlan = {
+        Daily: 0,
+        Monthly: 0,
+        Yearly: 0,
+        Lifetime: 0
+    };
+
+    availableKeys?.forEach((key: any) => {
+        keysByPlan[key.plan_type as keyof typeof keysByPlan]++;
+    });
+
+    return res.json({
+        balance: profile.reseller_balance,
+        totalSales: profile.reseller_total_sales,
+        availableKeys: keysByPlan
+    });
+});
+
+// 2. Get Wholesale Prices
+app.get('/api/reseller/wholesale-prices', async (req: Request, res: Response): Promise<any> => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Missing Token' });
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Invalid Token' });
+
+    const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('is_reseller')
+        .eq('id', user.id)
+        .single();
+
+    if (!profile?.is_reseller) {
+        return res.status(403).json({ error: 'Not authorized as reseller' });
+    }
+
+    return res.json(WHOLESALE_PRICES);
+});
+
+// 3. Purchase Wholesale Keys
+app.post('/api/reseller/purchase-keys', async (req: Request, res: Response): Promise<any> => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Missing Token' });
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Invalid Token' });
+
+
+    const { planType, quantity, billingType, cpfCnpj, name, phone, creditCard } = req.body;
+
+    if (!planType || !quantity || quantity < 1) {
+        return res.status(400).json({ error: 'Invalid plan type or quantity' });
+    }
+
+    if (!billingType || !cpfCnpj || !name || !phone) {
+        return res.status(400).json({ error: 'Missing required payment information' });
+    }
+
+    const planKey = planType.toLowerCase();
+    const unitCost = WHOLESALE_PRICES[planKey];
+
+    if (!unitCost) {
+        return res.status(400).json({ error: 'Invalid plan type' });
+    }
+
+    const totalCost = unitCost * quantity;
+
+    try {
+        // Get or create Asaas customer for reseller
+        const { data: profile } = await supabaseAdmin
+            .from('profiles')
+            .select('asaas_customer_id, email')
+            .eq('id', user.id)
+            .single();
+
+        let customerId = profile?.asaas_customer_id;
+
+        // Verify if customer exists in Asaas (in case of env switch or deleted customer)
+        if (customerId) {
+            try {
+                await axios.get(`${ASAAS_API_URL}/customers/${customerId}`, {
+                    headers: { access_token: ASAAS_API_KEY }
+                });
+                console.log('Using existing valid Asaas customer:', customerId);
+            } catch (err: any) {
+                if (err.response?.status === 404) {
+                    console.log('Stale customer ID found, marking for re-creation:', customerId);
+                    customerId = null;
+                } else {
+                    console.error('Error verifying customer:', err.message);
+                }
+            }
+        }
+
+        if (!customerId) {
+            console.log('Creating new Asaas customer for reseller:', profile?.email);
+            const customerResponse = await axios.post(`${ASAAS_API_URL}/customers`, {
+                name,
+                cpfCnpj,
+                email: profile?.email,
+                phone
+            }, {
+                headers: { access_token: ASAAS_API_KEY }
+            });
+
+            customerId = customerResponse.data.id;
+            console.log('New Asaas customer created:', customerId);
+
+            await supabaseAdmin
+                .from('profiles')
+                .update({ asaas_customer_id: customerId })
+                .eq('id', user.id);
+        }
+
+        // Create Asaas payment
+        const paymentPayload: any = {
+            customer: customerId,
+            billingType,
+            value: totalCost,
+            dueDate: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+            description: `Wholesale purchase: ${quantity}x ${planType} keys`
+        };
+
+        if (billingType === 'CREDIT_CARD' && creditCard) {
+            paymentPayload.creditCard = {
+                holderName: creditCard.holderName,
+                number: creditCard.number,
+                expiryMonth: creditCard.expiryMonth,
+                expiryYear: creditCard.expiryYear,
+                ccv: creditCard.ccv
+            };
+            paymentPayload.creditCardHolderInfo = {
+                name,
+                cpfCnpj,
+                phone
+            };
+        }
+
+        const paymentResponse = await axios.post(`${ASAAS_API_URL}/payments`, paymentPayload, {
+            headers: { access_token: ASAAS_API_KEY }
+        });
+
+        const paymentId = paymentResponse.data.id;
+        const paymentStatus = paymentResponse.data.status;
+
+        // Record purchase in database
+        const { data: purchase, error: insertError } = await supabaseAdmin.from('reseller_purchases').insert({
+            reseller_id: user.id,
+            plan_type: planType,
+            quantity,
+            unit_cost: unitCost,
+            total_cost: totalCost,
+            payment_id: paymentId,
+            payment_status: paymentStatus === 'CONFIRMED' || paymentStatus === 'RECEIVED' ? 'confirmed' : 'pending',
+            keys_generated: false
+        }).select().single();
+
+        if (insertError) {
+            console.error("DB: Reseller Purchase Insert Error:", insertError);
+            // Even if DB insert fails, we return the payment data if we have it, 
+            // but log the error for debugging.
+        }
+
+        // If payment is immediately confirmed (credit card), generate keys
+        if (paymentStatus === 'CONFIRMED' || paymentStatus === 'RECEIVED') {
+            const keys = [];
+            for (let i = 0; i < quantity; i++) {
+                const randomPart = Math.random().toString(36).substring(2, 10).toUpperCase() + 
+                                 Math.random().toString(36).substring(2, 10).toUpperCase();
+                const licenseKey = `${planType.toUpperCase()}_RESELLER_${randomPart}`;
+                
+                keys.push({
+                    reseller_id: user.id,
+                    license_key: licenseKey,
+                    plan_type: planType,
+                    status: 'available'
+                });
+            }
+
+            await supabaseAdmin.from('reseller_keys').insert(keys);
+            await supabaseAdmin.from('reseller_purchases')
+                .update({ keys_generated: true, payment_status: 'confirmed' })
+                .eq('id', purchase.id);
+
+            return res.json({
+                success: true,
+                paymentId,
+                status: 'CONFIRMED',
+                keys: keys.map(k => k.license_key),
+                message: `Successfully purchased ${quantity} ${planType} keys`
+            });
+        }
+
+        // For PIX, fetch QR code
+        let pixData = null;
+        if (billingType === 'PIX') {
+            try {
+                const pixResponse = await axios.get(`${ASAAS_API_URL}/payments/${paymentId}/pixQrCode`, {
+                    headers: { access_token: ASAAS_API_KEY }
+                });
+                pixData = {
+                    encodedImage: pixResponse.data.encodedImage,
+                    payload: pixResponse.data.payload,
+                    expirationDate: pixResponse.data.expirationDate
+                };
+            } catch (pixErr) {
+                console.warn('Failed to fetch PIX QR Code:', pixErr);
+            }
+        }
+
+        return res.json({
+            success: true,
+            paymentId,
+            status: paymentStatus,
+            pix: pixData,
+            invoiceUrl: paymentResponse.data.invoiceUrl,
+            message: 'Payment created. Keys will be generated upon confirmation.'
+        });
+    } catch (err: any) {
+        console.error('Reseller purchase error:', err.response?.data || err.message);
+        if (err.response?.data?.errors) {
+            console.error('Asaas Errors:', JSON.stringify(err.response.data.errors, null, 2));
+        }
+        return res.status(500).json({ 
+            error: 'Failed to process purchase', 
+            details: err.response?.data?.errors || err.message 
+        });
+    }
+});
+
+// 4. List Reseller Keys
+app.get('/api/reseller/keys', async (req: Request, res: Response): Promise<any> => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Missing Token' });
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Invalid Token' });
+
+    const { data: keys } = await supabaseAdmin
+        .from('reseller_keys')
+        .select('*')
+        .eq('reseller_id', user.id)
+        .order('created_at', { ascending: false });
+
+    return res.json({ keys: keys || [] });
+});
+
+// 5. Request Withdrawal
+app.post('/api/reseller/withdraw', async (req: Request, res: Response): Promise<any> => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Missing Token' });
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Invalid Token' });
+
+    const { amount, pixKey } = req.body;
+
+    if (!amount || amount <= 0 || !pixKey) {
+        return res.status(400).json({ error: 'Invalid amount or PIX key' });
+    }
+
+    // Check balance
+    const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('is_reseller, reseller_balance')
+        .eq('id', user.id)
+        .single();
+
+    if (!profile?.is_reseller) {
+        return res.status(403).json({ error: 'Not authorized as reseller' });
+    }
+
+    if (profile.reseller_balance < amount) {
+        return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    try {
+        // Create withdrawal request
+        await supabaseAdmin.from('withdrawal_requests').insert({
+            reseller_id: user.id,
+            amount,
+            pix_key: pixKey,
+            status: 'pending'
+        });
+
+        return res.json({ message: 'Withdrawal request submitted successfully' });
+    } catch (err) {
+        console.error('Withdrawal request error:', err);
+        return res.status(500).json({ error: 'Failed to submit withdrawal request' });
+    }
+});
+
+// 6. Get Withdrawal History
+app.get('/api/reseller/withdrawals', async (req: Request, res: Response): Promise<any> => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Missing Token' });
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Invalid Token' });
+
+    const { data: withdrawals } = await supabaseAdmin
+        .from('withdrawal_requests')
+        .select('*')
+        .eq('reseller_id', user.id)
+        .order('created_at', { ascending: false });
+
+    return res.json({ withdrawals: withdrawals || [] });
+});
 
 // Download Route (Mocked security)
 app.get('/api/download/loader', (req: Request, res: Response) => {
@@ -603,6 +1038,85 @@ app.get('/api/download/loader', (req: Request, res: Response) => {
 // Health Check
 app.get('/health', (req: Request, res: Response) => {
     res.status(200).send('OK');
+});
+
+// 7. Redeem License Key (Reseller Key)
+app.post('/api/payments/redeem-key', async (req: Request, res: Response): Promise<any> => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Missing Token' });
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Invalid Token' });
+
+    const { licenseKey } = req.body;
+
+    if (!licenseKey) {
+        return res.status(400).json({ error: 'License key is required' });
+    }
+
+    try {
+        // 1. Check if key exists and is available
+        const { data: keyData, error: keyError } = await supabaseAdmin
+            .from('reseller_keys')
+            .select('*')
+            .eq('license_key', licenseKey)
+            .eq('status', 'available')
+            .single();
+
+        if (keyError || !keyData) {
+            return res.status(404).json({ error: 'Invalid or already used license key' });
+        }
+
+        // 2. Calculate expiry based on plan type
+        let expiryDate = new Date();
+        const planName = keyData.plan_type;
+        if (planName === 'Daily') expiryDate.setDate(expiryDate.getDate() + 1);
+        else if (planName === 'Monthly') expiryDate.setDate(expiryDate.getDate() + 30);
+        else if (planName === 'Yearly') expiryDate.setDate(expiryDate.getDate() + 365);
+        else if (planName === 'Lifetime') expiryDate.setFullYear(expiryDate.getFullYear() + 99);
+
+        // 3. Update User Profile
+        const { error: profileUpdateError } = await supabaseAdmin
+            .from('profiles')
+            .update({
+                plan: planName,
+                status: 'Active',
+                license_key: licenseKey,
+                expires_at: expiryDate.toISOString()
+            })
+            .eq('id', user.id);
+
+        if (profileUpdateError) throw profileUpdateError;
+
+        // 4. Update Key Status
+        await supabaseAdmin
+            .from('reseller_keys')
+            .update({
+                status: 'activated',
+                sold_to_user_id: user.id,
+                activated_at: new Date().toISOString()
+            } as any)
+            .eq('id', keyData.id);
+
+        // 5. Update Reseller Sales Info
+        await supabaseAdmin
+            .from('profiles')
+            .update({ 
+                reseller_total_sales: (await supabaseAdmin.from('profiles').select('reseller_total_sales').eq('id', keyData.reseller_id).single()).data?.reseller_total_sales + 1 
+            } as any)
+            .eq('id', keyData.reseller_id);
+
+        return res.json({
+            success: true,
+            message: `Key redeemed successfully! Plan ${planName} activated.`,
+            plan: planName,
+            expiresAt: expiryDate.toLocaleDateString()
+        });
+
+    } catch (err: any) {
+        console.error('Key redemption error:', err);
+        return res.status(500).json({ error: 'Failed to redeem key' });
+    }
 });
 
 // Start Server
