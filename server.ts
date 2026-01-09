@@ -518,6 +518,11 @@ app.get('/api/download/loader', (req: Request, res: Response) => {
     res.json({ url: "https://starlix.net/download/loader_v2.exe" });
 });
 
+// Health Check
+app.get('/health', (req: Request, res: Response) => {
+    res.status(200).send('OK');
+});
+
 // Start Server
 app.listen(port, () => {
     console.log(`Backend Server running on port ${port}`);
