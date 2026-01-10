@@ -16,7 +16,13 @@ const app = express();
 const port = process.env.PORT || 4000;
 
 app.use(cors({
-    origin: ['http://localhost:3000', 'https://starlix-back.onrender.com', 'https://starlix-7c7d.onrender.com'], // Allow Frontend (Local & Prod)
+    origin: [
+        'http://localhost:3000', 
+        'https://starlix-back.onrender.com', 
+        'https://starlix-7c7d.onrender.com',
+        'https://www.starlixmenu.online',
+        'https://starlixmenu.online'
+    ], // Allow Frontend (Local & Prod)
     credentials: true
 }));
 app.use(express.json());
