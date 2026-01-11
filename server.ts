@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
+import path from 'path';
 
 dotenv.config();
 
@@ -1125,7 +1126,31 @@ app.post('/api/payments/redeem-key', async (req: Request, res: Response): Promis
     }
 });
 
-// Start Server
+// Download AnyDesk Route
+app.get('/api/download/anydesk', (req: Request, res: Response) => {
+    // Try process.cwd() first, then fallback to __dirname
+    let filePath = path.join(process.cwd(), 'd', 'AnyDesk.zip');
+    
+    // In prod (dist), process.cwd() should still be the backend root
+    // but let's be double sure and check if it exists or adjust
+    res.download(filePath, 'AnyDesk.zip', (err) => {
+        if (err) {
+            console.error('Download error with process.cwd():', err);
+            // Fallback to __dirname (works in dev)
+            const fallbackPath = path.join(__dirname, 'd', 'AnyDesk.zip');
+            res.download(fallbackPath, 'AnyDesk.zip', (err2) => {
+                if (err2) {
+                    console.error('Download error with fallback:', err2);
+                    if (!res.headersSent) {
+                        res.status(500).json({ error: 'Could not download the file.' });
+                    }
+                }
+            });
+        }
+    });
+});
+
+// Start Server       
 app.listen(port, () => {
     console.log(`Backend Server running on port ${port}`);
 });
