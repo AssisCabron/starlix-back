@@ -1150,6 +1150,25 @@ app.get('/api/download/anydesk', (req: Request, res: Response) => {
     });
 });
 
+// Download Starlix Loader Route
+app.get('/api/download/loader', (req: Request, res: Response) => {
+    let filePath = path.join(process.cwd(), 'd', 'starlix.zip');
+    res.download(filePath, 'starlix.zip', (err) => {
+        if (err) {
+            console.error('Download error with process.cwd():', err);
+            const fallbackPath = path.join(__dirname, 'd', 'starlix.zip');
+            res.download(fallbackPath, 'starlix.zip', (err2) => {
+                if (err2) {
+                    console.error('Download error with fallback:', err2);
+                    if (!res.headersSent) {
+                        res.status(500).json({ error: 'Could not download the file.' });
+                    }
+                }
+            });
+        }
+    });
+});
+
 // Start Server       
 app.listen(port, () => {
     console.log(`Backend Server running on port ${port}`);
