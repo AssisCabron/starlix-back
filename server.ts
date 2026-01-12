@@ -1036,12 +1036,6 @@ app.get('/api/reseller/withdrawals', async (req: Request, res: Response): Promis
     return res.json({ withdrawals: withdrawals || [] });
 });
 
-// Download Route (Mocked security)
-app.get('/api/download/loader', (req: Request, res: Response) => {
-    // In real app, verify token again before redirecting for download
-    res.json({ url: "https://starlix.net/download/loader_v2.exe" });
-});
-
 // Health Check
 app.get('/health', (req: Request, res: Response) => {
     res.status(200).send('OK');
