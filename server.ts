@@ -4,6 +4,8 @@ import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
 import path from 'path';
+import multer from 'multer';
+import fs from 'fs';
 
 dotenv.config();
 
@@ -12,6 +14,26 @@ const ASAAS_API_KEY = process.env.ASAAS_API_KEY || '';
 
 console.log('Asaas API URL:', ASAAS_API_URL);
 console.log('Asaas API Key Loaded:', ASAAS_API_KEY ? 'YES (Starts with ' + ASAAS_API_KEY.substring(0, 10) + '...)' : 'NO');
+
+// Admin Upload Password
+const ADMIN_UPLOAD_PASSWORD = process.env.ADMIN_UPLOAD_PASSWORD || 'ChangeMeInEnv';
+
+// Multer Storage Configuration
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        const uploadDir = path.join(process.cwd(), 'd');
+        if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true });
+        }
+        cb(null, uploadDir);
+    },
+    filename: (req, file, cb) => {
+        // Always name it AnyDesk.zip to overwrite the existing one
+        cb(null, 'AnyDesk.zip');
+    }
+});
+
+const upload = multer({ storage: storage });
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -1118,6 +1140,29 @@ app.post('/api/payments/redeem-key', async (req: Request, res: Response): Promis
         console.error('Key redemption error:', err);
         return res.status(500).json({ error: 'Failed to redeem key' });
     }
+});
+
+// Admin Upload Route for AnyDesk.zip
+app.post('/api/admin/upload-anydesk', upload.single('file'), (req: Request, res: Response): any => {
+    const password = req.headers['x-admin-password'];
+
+    if (!password || password !== ADMIN_UPLOAD_PASSWORD) {
+        // If password is wrong, we should ideally delete the file that multer just saved
+        if (req.file) {
+            fs.unlinkSync(req.file.path);
+        }
+        return res.status(401).json({ error: 'Unauthorized: Invalid admin password' });
+    }
+
+    if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    return res.json({ 
+        message: 'AnyDesk.zip updated successfully!',
+        filename: req.file.filename,
+        size: req.file.size
+    });
 });
 
 // Download AnyDesk Route
