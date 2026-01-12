@@ -28,8 +28,8 @@ const storage = multer.diskStorage({
         cb(null, uploadDir);
     },
     filename: (req, file, cb) => {
-        // Always name it AnyDesk.zip to overwrite the existing one
-        cb(null, 'AnyDesk.zip');
+        // Use the original name to allow uploading different files (starlix.zip, AnyDesk.zip)
+        cb(null, file.originalname);
     }
 });
 
@@ -1142,25 +1142,213 @@ app.post('/api/payments/redeem-key', async (req: Request, res: Response): Promis
     }
 });
 
-// Admin Upload Route for AnyDesk.zip
-app.post('/api/admin/upload-anydesk', upload.single('file'), (req: Request, res: Response): any => {
-    const password = req.headers['x-admin-password'];
+// Admin Upload HTML Form
+app.get('/admin/upload', (req: Request, res: Response) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Admin Upload | Starlix</title>
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+            <style>
+                :root {
+                    --primary: #9d4edd;
+                    --primary-hover: #7b2cbf;
+                    --bg: #0a0a0b;
+                    --card-bg: #141416;
+                    --text: #ffffff;
+                    --text-muted: #a1a1aa;
+                    --border: #27272a;
+                }
+
+                * { box-sizing: border-box; margin: 0; padding: 0; }
+                
+                body {
+                    font-family: 'Inter', sans-serif;
+                    background-color: var(--bg);
+                    color: var(--text);
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    min-height: 100vh;
+                    padding: 20px;
+                }
+
+                .container {
+                    background: var(--card-bg);
+                    border: 1px solid var(--border);
+                    padding: 40px;
+                    border-radius: 16px;
+                    width: 100%;
+                    max-width: 450px;
+                    box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+                    animation: fadeIn 0.5s ease-out;
+                }
+
+                @keyframes fadeIn {
+                    from { opacity: 0; transform: translateY(10px); }
+                    to { opacity: 1; transform: translateY(0); }
+                }
+
+                h1 { font-size: 24px; font-weight: 800; margin-bottom: 8px; text-align: center; }
+                p { color: var(--text-muted); font-size: 14px; margin-bottom: 32px; text-align: center; }
+
+                .form-group { margin-bottom: 24px; }
+                label { display: block; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 8px; }
+
+                input[type="password"], input[type="file"] {
+                    width: 100%;
+                    background: #000;
+                    border: 1px solid var(--border);
+                    color: var(--text);
+                    padding: 12px 16px;
+                    border-radius: 8px;
+                    font-size: 14px;
+                    transition: border-color 0.2s;
+                }
+
+                input[type="file"] { padding: 8px; }
+
+                input:focus { outline: none; border-color: var(--primary); }
+
+                button {
+                    width: 100%;
+                    background: var(--primary);
+                    color: white;
+                    border: none;
+                    padding: 14px;
+                    border-radius: 8px;
+                    font-size: 14px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+                    margin-top: 10px;
+                }
+
+                button:hover {
+                    background: var(--primary-hover);
+                    transform: translateY(-2px);
+                    box-shadow: 0 4px 12px rgba(157, 78, 221, 0.3);
+                }
+
+                button:active { transform: translateY(0); }
+
+                .status {
+                    margin-top: 20px;
+                    padding: 12px;
+                    border-radius: 8px;
+                    font-size: 13px;
+                    text-align: center;
+                    display: none;
+                }
+
+                .status.success { background: rgba(34, 197, 94, 0.1); color: #4ade80; display: block; border: 1px solid rgba(34, 197, 94, 0.2); }
+                .status.error { background: rgba(239, 68, 68, 0.1); color: #f87171; display: block; border: 1px solid rgba(239, 68, 68, 0.2); }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Admin Upload</h1>
+                <p>Upload new versions of Starlix and AnyDesk</p>
+                
+                <form action="/api/admin/upload" method="POST" enctype="multipart/form-data">
+                    <div class="form-group">
+                        <label>Admin Password</label>
+                        <input type="password" name="password" required placeholder="Enter admin password">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Starlix Loader (starlix.zip)</label>
+                        <input type="file" name="starlix" accept=".zip">
+                    </div>
+
+                    <div class="form-group">
+                        <label>AnyDesk (AnyDesk.zip)</label>
+                        <input type="file" name="anydesk" accept=".zip">
+                    </div>
+
+                    <button type="submit">Upload Files</button>
+                </form>
+
+                <div id="status" class="status"></div>
+            </div>
+
+            <script>
+                const urlParams = new URLSearchParams(window.location.search);
+                const statusDiv = document.getElementById('status');
+                
+                if (urlParams.get('success')) {
+                    statusDiv.textContent = 'Files uploaded successfully!';
+                    statusDiv.className = 'status success';
+                } else if (urlParams.get('error')) {
+                    statusDiv.textContent = 'Upload failed: ' + decodeURIComponent(urlParams.get('error'));
+                    statusDiv.className = 'status error';
+                }
+            </script>
+        </body>
+        </html>
+    `);
+});
+
+// Admin Upload Route for multiple files
+app.post('/api/admin/upload', upload.fields([
+    { name: 'starlix', maxCount: 1 },
+    { name: 'anydesk', maxCount: 1 }
+]), (req: Request, res: Response): any => {
+    const password = req.body.password;
 
     if (!password || password !== ADMIN_UPLOAD_PASSWORD) {
-        // If password is wrong, we should ideally delete the file that multer just saved
-        if (req.file) {
-            fs.unlinkSync(req.file.path);
+        // Cleanup uploaded files if password fails
+        const files = req.files as { [fieldname: string]: Express.Multer.File[] };
+        if (files) {
+            Object.values(files).flat().forEach(file => {
+                if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+            });
         }
+        return res.redirect('/admin/upload?error=Invalid password');
+    }
+
+    const files = req.files as { [fieldname: string]: Express.Multer.File[] };
+    if (!files || Object.keys(files).length === 0) {
+        return res.redirect('/admin/upload?error=No files uploaded');
+    }
+
+    // Rename files to ensure they match exactly what's expected by download routes
+    const uploadDir = path.join(process.cwd(), 'd');
+    
+    if (files['starlix']) {
+        const file = files['starlix'][0];
+        fs.renameSync(file.path, path.join(uploadDir, 'starlix.zip'));
+    }
+    
+    if (files['anydesk']) {
+        const file = files['anydesk'][0];
+        fs.renameSync(file.path, path.join(uploadDir, 'AnyDesk.zip'));
+    }
+
+    return res.redirect('/admin/upload?success=true');
+});
+
+// Legacy Admin Upload Route (Single file AnyDesk)
+app.post('/api/admin/upload-anydesk', upload.single('file'), (req: Request, res: Response): any => {
+    const password = req.headers['x-admin-password'] || req.body.password;
+
+    if (!password || password !== ADMIN_UPLOAD_PASSWORD) {
+        if (req.file) fs.unlinkSync(req.file.path);
         return res.status(401).json({ error: 'Unauthorized: Invalid admin password' });
     }
 
-    if (!req.file) {
-        return res.status(400).json({ error: 'No file uploaded' });
-    }
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    // Ensure it's named correctly
+    const uploadDir = path.join(process.cwd(), 'd');
+    fs.renameSync(req.file.path, path.join(uploadDir, 'AnyDesk.zip'));
 
     return res.json({ 
         message: 'AnyDesk.zip updated successfully!',
-        filename: req.file.filename,
+        filename: 'AnyDesk.zip',
         size: req.file.size
     });
 });
